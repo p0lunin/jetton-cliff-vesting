@@ -1,0 +1,246 @@
+#include "imports/stdlib.fc";
+
+const int op::init = 0;
+const int op::withdraw = 1;
+const int op::emergency_message = 2;
+const int op::transfer_notification = 0x7362d09c;
+const int op::transfer = 0x5fcc3d14;
+const int op::transfer_tokens = 0x0f8a7ea5;
+const int op::excesses = 0xd53276db;
+
+(slice, slice, int, int, int, cell) load_data() inline {
+    var cs = get_data().begin_parse();
+
+    var my_jetton_wallet = cs~load_msg_addr(); ;; 12 + 32 + 256
+    var jetton_receiver = cs~load_msg_addr(); ;; 12 + 32 + 256
+    var start_date = cs~load_uint(64); ;; 64
+
+    var locked_balance = cs~load_coins(); ;; 4 + 128
+    var withdrawn_balance = cs~load_coins(); ;; 4 + 128
+
+    var vesting_info = cs~load_ref();
+
+    return (my_jetton_wallet, jetton_receiver, start_date, locked_balance, withdrawn_balance, vesting_info);
+}
+
+(int, int, int) load_vesting_info(slice cs) {
+    var cliff_date = cs~load_uint(64); ;; 64
+    var vesting_step = cs~load_uint(64); ;; 64
+    var vesting_amount = cs~load_coins(); ;; 4 + 128
+
+    return (cliff_date, vesting_step, vesting_amount);
+}
+
+() save_data(
+    slice my_jetton_wallet,
+    slice jetton_receiver,
+    int start_date,
+    int locked_balance,
+    int withdrawn_balance,
+    cell vesting_info
+) impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(my_jetton_wallet)
+            .store_slice(jetton_receiver)
+            .store_uint(start_date, 64)
+            .store_coins(locked_balance)
+            .store_coins(withdrawn_balance)
+            .store_ref(vesting_info)
+            .end_cell()
+    );
+}
+
+
+() send_tokens(slice jetton_wallet, slice to_address, int token_amount, int query_id) impure {
+    cell msg_body = begin_cell()
+        .store_uint(op::transfer_tokens, 32)
+        .store_uint(query_id, 64)
+        .store_coins(token_amount)
+        .store_slice(to_address)
+        .store_slice(to_address)
+        .store_uint(0, 1)
+        .store_coins(0)
+        .store_uint(0, 1).end_cell();
+
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(jetton_wallet)
+        .store_coins(0)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(msg_body).end_cell();
+
+    send_raw_message(msg, 64);
+}
+
+
+() recv_internal(cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    cs~load_uint(4);
+    slice sender_address = cs~load_msg_addr();
+
+    if (in_msg_body.slice_bits() == 0) {
+        var msg_cell = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(sender_address)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(msg_cell, 64);
+
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    var (my_jetton_wallet, jetton_receiver, start_date, locked_balance, withdrawn_balance, vesting_info) = load_data();
+
+    if (op == op::init) {
+        throw_unless(700, equal_slices(jetton_receiver, sender_address));
+        throw_unless(703, my_jetton_wallet.preload_uint(1) == 0);
+
+        var new_my_jetton_wallet = in_msg_body~load_msg_addr();
+
+        save_data(
+            new_my_jetton_wallet,
+            jetton_receiver,
+            start_date,
+            locked_balance,
+            withdrawn_balance,
+            vesting_info
+        );
+
+        return ();
+    }
+
+    if (op == op::transfer_notification) {
+        var amount = in_msg_body~load_coins();
+
+        if (~ equal_slices(my_jetton_wallet, sender_address)) {
+            var sender = in_msg_body~load_msg_addr();
+            send_tokens(sender_address, sender, amount, query_id);
+            return ();
+        }
+
+        locked_balance += amount;
+
+        save_data(
+            my_jetton_wallet,
+            jetton_receiver,
+            start_date,
+            locked_balance,
+            withdrawn_balance,
+            vesting_info
+        );
+
+        return ();
+    }
+
+    if (op == op::withdraw) {
+        var (cliff_date, vesting_step, vesting_amount) = load_vesting_info(vesting_info.begin_parse());
+
+        throw_unless(700, equal_slices(jetton_receiver, sender_address));
+        throw_unless(701, now() >= cliff_date);
+        throw_unless(702, locked_balance > withdrawn_balance);
+
+        var claimed_amount = vesting_amount * ((now() - start_date) / vesting_step);
+
+        var amount_to_send = min(
+            claimed_amount - withdrawn_balance,
+            locked_balance - withdrawn_balance
+        );
+
+        if (amount_to_send > 0) {
+            send_tokens(my_jetton_wallet, jetton_receiver, amount_to_send, query_id);
+
+            withdrawn_balance += amount_to_send;
+
+            save_data(
+                my_jetton_wallet,
+                jetton_receiver,
+                start_date,
+                locked_balance,
+                withdrawn_balance,
+                vesting_info
+            );
+        }
+
+        return ();
+    }
+
+    if (op == op::transfer) {
+        throw_unless(700, equal_slices(jetton_receiver, sender_address));
+
+        slice new_jetton_receiver = in_msg_body~load_msg_addr();
+
+        save_data(
+            my_jetton_wallet,
+            new_jetton_receiver,
+            start_date,
+            locked_balance,
+            withdrawn_balance,
+            vesting_info
+        );
+
+        return ();
+    }
+
+    if (op == op::emergency_message) {
+        throw_unless(700, equal_slices(jetton_receiver, sender_address));
+
+        var msg_cell = in_msg_body~load_ref();
+        var msg_mode = in_msg_body~load_uint(8);
+
+        var ms = msg_cell.begin_parse();
+
+        ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool
+        ;;  src:MsgAddressInt dest:MsgAddressInt
+        throw_if(800, ms~load_uint(1) == 1);
+        ms~load_uint(3);
+        ms~load_msg_addr();
+        throw_if(801, equal_slices(ms~load_msg_addr(), my_jetton_wallet));
+
+        send_raw_message(msg_cell, msg_mode);
+        return ();
+    }
+
+    if (op == op::excesses) {
+        var msg_cell = begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(jetton_receiver)
+            .store_coins(0)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .end_cell();
+        send_raw_message(msg_cell, 64);
+
+        return ();
+    }
+
+    ;; send
+    var msg_cell = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(sender_address)
+        .store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell();
+    send_raw_message(msg_cell, 64);
+
+    return ();
+}
+
+(slice, slice, int, int, int, int, int, int) get_vesting_data() method_id {
+    var (my_jetton_wallet, jetton_receiver, start_date, locked_balance, withdrawn_balance, vesting_info) = load_data();
+    var (cliff_date, vesting_step, vesting_amount) = load_vesting_info(vesting_info.begin_parse());
+
+    return (
+        my_jetton_wallet,
+        jetton_receiver,
+        start_date,
+        locked_balance,
+        withdrawn_balance,
+        cliff_date,
+        vesting_step,
+        vesting_amount
+    );
+}
